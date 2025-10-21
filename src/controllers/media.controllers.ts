@@ -24,17 +24,49 @@ interface YtDlpInfo {
 }
 
 /**
- * Check if yt-dlp is installed
+ * Get full path to yt-dlp binary
+ */
+async function getYtDlpPath(): Promise<string> {
+  try {
+    const { stdout } = await execAsync("which yt-dlp");
+    const ytDlpPath = stdout.trim();
+    console.log("[DEBUG] yt-dlp path:", ytDlpPath);
+    return ytDlpPath;
+  } catch (error) {
+    console.log("[DEBUG] 'which yt-dlp' failed, trying direct command");
+    return "yt-dlp"; // fallback to PATH
+  }
+}
+
+/**
+ * Check if yt-dlp is installed and log environment info
  */
 async function checkYtDlpInstalled(): Promise<boolean> {
   try {
+    console.log("[DEBUG] === Environment Check ===");
+    console.log("[DEBUG] Current user:", process.env.USER || "unknown");
+    console.log("[DEBUG] HOME:", process.env.HOME || "unknown");
+    console.log("[DEBUG] PWD:", process.cwd());
+    console.log("[DEBUG] PATH:", process.env.PATH);
+
+    const ytDlpPath = await getYtDlpPath();
+
     console.log("[DEBUG] Checking yt-dlp installation...");
-    const { stdout } = await execAsync("yt-dlp --version");
+    const { stdout, stderr } = await execAsync(`${ytDlpPath} --version`, {
+      env: process.env,
+    });
     console.log("[DEBUG] yt-dlp version:", stdout.trim());
+
+    if (stderr) {
+      console.log("[DEBUG] yt-dlp version stderr:", stderr);
+    }
+
     return true;
   } catch (error) {
-    const err = error as Error;
-    console.error("[ERROR] yt-dlp not found:", err.message);
+    const err = error as any;
+    console.error("[ERROR] yt-dlp not found or not accessible");
+    console.error("[ERROR] Error:", err.message);
+    console.error("[ERROR] stderr:", err.stderr);
     return false;
   }
 }
@@ -62,15 +94,40 @@ async function checkFFmpegInstalled(): Promise<boolean> {
 async function getMediaInfo(url: string): Promise<YtDlpInfo | YtDlpInfo[]> {
   try {
     console.log("[INFO] Fetching media info for:", url);
-    const command = `yt-dlp --dump-json --no-playlist "${url}"`;
+
+    const ytDlpPath = await getYtDlpPath();
+    const command = `${ytDlpPath} --dump-json --no-playlist "${url}"`;
     console.log("[DEBUG] Executing command:", command);
+    console.log("[DEBUG] Shell:", process.env.SHELL);
 
     const { stdout, stderr } = await execAsync(command, {
       maxBuffer: 1024 * 1024 * 10,
+      timeout: 30000,
+      env: {
+        ...process.env,
+        HOME: process.env.HOME,
+        PATH: process.env.PATH,
+      },
+      cwd: process.cwd(),
     });
 
     if (stderr) {
       console.warn("[WARN] yt-dlp stderr:", stderr);
+
+      // Check for specific errors
+      if (stderr.includes("Sign in to confirm")) {
+        throw new Error(
+          "YouTube bot detection triggered. Try adding cookies or wait before retrying."
+        );
+      }
+      if (stderr.includes("login required")) {
+        throw new Error(
+          "Login required for this platform. Use --cookies-from-browser option."
+        );
+      }
+      if (stderr.includes("rate-limit")) {
+        throw new Error("Rate limit reached. Please wait before trying again.");
+      }
     }
 
     const lines = stdout.trim().split("\n");
@@ -119,9 +176,20 @@ async function getMediaInfo(url: string): Promise<YtDlpInfo | YtDlpInfo[]> {
     const err = error as any;
     console.error("[ERROR] Failed to get media info");
     console.error("[ERROR] Error message:", err.message);
-    console.error("[ERROR] Error stderr:", err.stderr);
-    console.error("[ERROR] Error stdout:", err.stdout);
-    console.error("[ERROR] Full error:", JSON.stringify(err, null, 2));
+    console.error("[ERROR] Error code:", err.code);
+    console.error("[ERROR] Command:", err.cmd);
+
+    // Only log last 5 lines of stderr to avoid clutter
+    if (err.stderr) {
+      const stderrLines = err.stderr
+        .split("\n")
+        .filter((line: string) => line.trim());
+      const lastLines = stderrLines.slice(-5);
+      console.error(
+        "[ERROR] yt-dlp stderr (last 5 lines):",
+        lastLines.join("\n")
+      );
+    }
 
     // Check if it's an image-only tweet
     if (err.message.includes("No video could be found")) {
@@ -131,10 +199,7 @@ async function getMediaInfo(url: string): Promise<YtDlpInfo | YtDlpInfo[]> {
       );
     }
 
-    throw new AppError(
-      `Failed to extract media info: ${err.message}. URL may be invalid or require authentication.`,
-      400
-    );
+    throw new AppError(`Failed to extract media info: ${err.message}`, 400);
   }
 }
 
@@ -155,13 +220,28 @@ async function downloadWithYtDlp(
 
     // Create a temporary unique filename
     const tempFilename = `temp_${crypto.randomBytes(8).toString("hex")}`;
-    const outputTemplate = path.join(
-      path.dirname(outputPath),
-      `${tempFilename}.%(ext)s`
-    );
+    const outputDir = path.dirname(outputPath);
+    const outputTemplate = path.join(outputDir, `${tempFilename}.%(ext)s`);
 
     console.log("[DEBUG] Temp filename:", tempFilename);
+    console.log("[DEBUG] Output directory:", outputDir);
     console.log("[DEBUG] Output template:", outputTemplate);
+
+    // Ensure output directory exists
+    if (!existsSync(outputDir)) {
+      console.log("[INFO] Creating output directory:", outputDir);
+      await mkdir(outputDir, { recursive: true });
+    }
+
+    // Check permissions
+    try {
+      await writeFile(path.join(outputDir, ".test"), "test");
+      await unlink(path.join(outputDir, ".test"));
+      console.log("[DEBUG] Write permissions OK for:", outputDir);
+    } catch (permErr) {
+      console.error("[ERROR] No write permission for:", outputDir);
+      throw new Error(`No write permission for output directory: ${outputDir}`);
+    }
 
     // Check if FFmpeg is available for merging
     const hasFFmpeg = await checkFFmpegInstalled();
@@ -185,7 +265,7 @@ async function downloadWithYtDlp(
       console.log(
         "[INFO] Detected video format, selecting appropriate quality"
       );
-      // For videos - CRITICAL: merge video+audio for Instagram/social media
+      // For videos - merge video+audio for Instagram/social media
       if (hasFFmpeg) {
         formatSelection =
           "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best";
@@ -196,52 +276,82 @@ async function downloadWithYtDlp(
 
     console.log("[DEBUG] Format selection:", formatSelection);
 
+    const ytDlpPath = await getYtDlpPath();
+
     const command = [
-      "yt-dlp",
+      ytDlpPath,
       `--format "${formatSelection}"`,
       hasFFmpeg ? "--merge-output-format mp4" : "",
       "--no-playlist",
       "--no-warnings",
+      "--newline", // Show progress on new lines (better for logging)
       `--output "${outputTemplate}"`,
       `"${url}"`,
     ]
       .filter(Boolean)
       .join(" ");
 
-    console.log("[INFO] Executing download command:", command);
+    console.log("[INFO] Executing download command");
+    console.log("[DEBUG] Full command:", command);
 
     const startTime = Date.now();
     const { stdout, stderr } = await execAsync(command, {
       maxBuffer: 1024 * 1024 * 100,
       timeout: 120000,
+      env: {
+        ...process.env,
+        HOME: process.env.HOME,
+        PATH: process.env.PATH,
+      },
+      cwd: outputDir, // Run from output directory
     });
     const duration = Date.now() - startTime;
 
     console.log("[INFO] Download completed in", duration, "ms");
-    if (stdout) console.log("[DEBUG] yt-dlp stdout:", stdout);
-    if (stderr) console.warn("[WARN] yt-dlp stderr:", stderr);
+
+    if (stdout) {
+      const stdoutLines = stdout.split("\n").filter((line) => line.trim());
+      console.log(
+        "[DEBUG] yt-dlp output (last 5 lines):",
+        stdoutLines.slice(-5).join("\n")
+      );
+    }
+
+    if (stderr) {
+      const stderrLines = stderr
+        .split("\n")
+        .filter((line) => line.trim() && line.includes("ERROR"));
+      if (stderrLines.length > 0) {
+        console.warn("[WARN] yt-dlp errors:", stderrLines.join("\n"));
+      }
+    }
 
     // Find the downloaded file (extension might be different after merge)
-    const dir = path.dirname(outputPath);
-    const files = await readdir(dir);
-    console.log("[DEBUG] Files in directory:", files);
+    const files = await readdir(outputDir);
+    console.log("[DEBUG] Looking for files starting with:", tempFilename);
+    console.log(
+      "[DEBUG] Files in directory:",
+      files.filter((f) => f.startsWith(tempFilename))
+    );
 
     const downloadedFile = files.find((f) => f.startsWith(tempFilename));
 
     if (!downloadedFile) {
-      console.error(
-        "[ERROR] Downloaded file not found. Expected prefix:",
-        tempFilename
-      );
-      console.error("[ERROR] Files in directory:", files);
-      throw new Error("Downloaded file not found");
+      console.error("[ERROR] Downloaded file not found!");
+      console.error("[ERROR] Expected prefix:", tempFilename);
+      console.error("[ERROR] All files in directory:", files);
+      throw new Error("Downloaded file not found in output directory");
     }
 
-    const downloadedPath = path.join(dir, downloadedFile);
+    const downloadedPath = path.join(outputDir, downloadedFile);
     console.log("[INFO] Downloaded file found:", downloadedPath);
 
     const fileStats = await stat(downloadedPath);
     console.log("[INFO] File size:", fileStats.size, "bytes");
+
+    if (fileStats.size === 0) {
+      throw new Error("Downloaded file is empty (0 bytes)");
+    }
 
     if (!info) {
       throw new Error("Failed to retrieve media info");
@@ -256,13 +366,27 @@ async function downloadWithYtDlp(
     console.error("[ERROR] Download failed");
     console.error("[ERROR] Error message:", err.message);
     console.error("[ERROR] Error code:", err.code);
-    console.error("[ERROR] Error stderr:", err.stderr);
-    console.error("[ERROR] Error stdout:", err.stdout);
-    console.error("[ERROR] Full error:", JSON.stringify(err, null, 2));
+
+    if (err.stderr) {
+      const stderrLines = err.stderr
+        .split("\n")
+        .filter((line: string) => line.trim());
+      console.error(
+        "[ERROR] stderr (last 10 lines):",
+        stderrLines.slice(-10).join("\n")
+      );
+    }
 
     // Provide more specific error messages
     if (err.message.includes("No video could be found")) {
       throw new AppError("This post contains only images, not videos", 400);
+    }
+
+    if (err.stderr && err.stderr.includes("bot")) {
+      throw new AppError(
+        "Bot detection triggered. Please wait a few minutes before retrying.",
+        429
+      );
     }
 
     throw new AppError(`Failed to download media: ${err.message}`, 502);
@@ -270,7 +394,7 @@ async function downloadWithYtDlp(
 }
 
 /**
- * Download images from posts (for X.com tweets with only images)
+ * Download images from posts
  */
 async function downloadImagesFromPost(
   url: string,
@@ -287,9 +411,11 @@ async function downloadImagesFromPost(
 
     console.log("[DEBUG] Image temp filename:", tempFilename);
 
+    const ytDlpPath = await getYtDlpPath();
+
     // Download all images from the post
     const command = [
-      "yt-dlp",
+      ytDlpPath,
       "--format best",
       "--write-thumbnail",
       "--skip-download",
@@ -297,23 +423,24 @@ async function downloadImagesFromPost(
       `"${url}"`,
     ].join(" ");
 
-    console.log("[INFO] Downloading images with command:", command);
+    console.log("[INFO] Downloading images");
 
-    // First try to get images using --write-thumbnail
     try {
       const { stdout, stderr } = await execAsync(command, {
         maxBuffer: 1024 * 1024 * 50,
         timeout: 60000,
+        env: process.env,
+        cwd: outputDir,
       });
-      if (stdout) console.log("[DEBUG] Image download stdout:", stdout);
-      if (stderr) console.warn("[WARN] Image download stderr:", stderr);
+      if (stdout)
+        console.log("[DEBUG] Image download output:", stdout.slice(-200));
     } catch (err) {
       console.log(
         "[WARN] Thumbnail method failed, trying direct image extraction"
       );
 
       const altCommand = [
-        "yt-dlp",
+        ytDlpPath,
         "--no-video",
         "--write-thumbnail",
         "--convert-thumbnails jpg",
@@ -321,14 +448,14 @@ async function downloadImagesFromPost(
         `"${url}"`,
       ].join(" ");
 
-      console.log("[INFO] Alternative command:", altCommand);
-
       const { stdout, stderr } = await execAsync(altCommand, {
         maxBuffer: 1024 * 1024 * 50,
         timeout: 60000,
+        env: process.env,
+        cwd: outputDir,
       });
-      if (stdout) console.log("[DEBUG] Alt image download stdout:", stdout);
-      if (stderr) console.warn("[WARN] Alt image download stderr:", stderr);
+      if (stdout)
+        console.log("[DEBUG] Alt image download output:", stdout.slice(-200));
     }
 
     // Find downloaded files
@@ -338,8 +465,6 @@ async function downloadImagesFromPost(
     console.log("[INFO] Found", downloadedFiles.length, "image file(s)");
 
     if (downloadedFiles.length === 0) {
-      console.error("[ERROR] No images found with prefix:", tempFilename);
-      console.error("[ERROR] Files in directory:", files);
       throw new Error("No images found in post");
     }
 
@@ -351,9 +476,7 @@ async function downloadImagesFromPost(
     };
   } catch (error) {
     const err = error as any;
-    console.error("[ERROR] Image download failed");
-    console.error("[ERROR] Error message:", err.message);
-    console.error("[ERROR] Full error:", JSON.stringify(err, null, 2));
+    console.error("[ERROR] Image download failed:", err.message);
     throw new AppError(`Failed to download images: ${err.message}`, 502);
   }
 }
@@ -374,15 +497,11 @@ async function directDownload(url: string): Promise<{
     Referer: url,
   };
 
-  console.log("[DEBUG] Request headers:", headers);
-
   const res = await fetch(url, { headers });
 
   console.log("[DEBUG] Response status:", res.status);
-  console.log(
-    "[DEBUG] Response headers:",
-    Object.fromEntries(res.headers.entries())
-  );
+  const contentType = res.headers.get("content-type");
+  console.log("[DEBUG] Content-Type:", contentType);
 
   if (!res.ok) {
     throw new AppError(
@@ -393,14 +512,12 @@ async function directDownload(url: string): Promise<{
 
   const arrayBuffer = await res.arrayBuffer();
   const buffer = Buffer.from(arrayBuffer);
-  const contentType = res.headers.get("content-type");
 
   console.log(
     "[INFO] Direct download successful. Size:",
     buffer.length,
     "bytes"
   );
-  console.log("[DEBUG] Content-Type:", contentType);
 
   return { buffer, contentType };
 }
@@ -478,7 +595,6 @@ export const fetchMedia = asyncHandler(async (req: Request, res: Response) => {
             console.log("[INFO] Attempting to download images instead...");
             const imageResult = await downloadImagesFromPost(url, mediaDir);
 
-            // For multiple images, return the first one (or handle multiple)
             if (imageResult.filePaths.length > 0) {
               const firstImage = imageResult.filePaths[0];
               if (!firstImage) {
@@ -495,7 +611,6 @@ export const fetchMedia = asyncHandler(async (req: Request, res: Response) => {
               for (let i = 1; i < imageResult.filePaths.length; i++) {
                 const imagePath = imageResult.filePaths[i];
                 if (imagePath) {
-                  console.log("[DEBUG] Cleaning up temp file:", imagePath);
                   await unlink(imagePath).catch(() => {});
                 }
               }
@@ -504,9 +619,7 @@ export const fetchMedia = asyncHandler(async (req: Request, res: Response) => {
               fileSize = stats.size;
               mediaType = "image";
 
-              console.log("[SUCCESS] Image downloaded successfully");
-              console.log("[SUCCESS] Filename:", filename);
-              console.log("[SUCCESS] Size:", fileSize, "bytes\n");
+              console.log("[SUCCESS] Image downloaded successfully\n");
 
               return res.json({
                 success: true,
@@ -621,9 +734,6 @@ export const fetchMedia = asyncHandler(async (req: Request, res: Response) => {
     console.error("[FATAL] All download methods failed");
     console.error("[FATAL] Final error:", err.message);
     console.error("[FATAL] Stack trace:", err.stack);
-    throw new AppError(
-      `Failed to download media. Both yt-dlp and direct download methods failed. ${err.message}`,
-      502
-    );
+    throw new AppError(`Failed to download media. ${err.message}`, 502);
   }
 });
